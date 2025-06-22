@@ -1,3 +1,5 @@
+#[cfg(any(feature = "sqlite", feature = "redb"))]
+use crate::persister::PersisterError;
 use bdk_wallet::bitcoin::hex::HexToBytesError;
 use bdk_wallet::bitcoin::psbt::ExtractTxError;
 use bdk_wallet::bitcoin::{base64, consensus};
@@ -57,8 +59,9 @@ pub enum BDKCliError {
     #[error("PsbtError: {0}")]
     PsbtError(#[from] bdk_wallet::bitcoin::psbt::Error),
 
-    #[error("Rusqlite error: {0}")]
-    RusqliteError(#[from] bdk_wallet::rusqlite::Error),
+    #[cfg(any(feature = "redb", feature = "sqlite"))]
+    #[error("Persistence error: {0}")]
+    PersistenceError(#[from] PersisterError),
 
     #[error("Serde json error: {0}")]
     SerdeJson(#[from] serde_json::Error),
