@@ -13,8 +13,6 @@
 use crate::commands::OfflineWalletSubCommand::*;
 use crate::commands::*;
 use crate::error::BDKCliError as Error;
-#[cfg(any(feature = "sqlite", feature = "redb"))]
-use crate::persister::{Persister, PersisterError};
 #[cfg(feature = "cbf")]
 use crate::utils::BlockchainClient::KyotoClient;
 use crate::utils::*;
@@ -764,40 +762,46 @@ pub(crate) async fn handle_command(cli_opts: CliOpts) -> Result<String, Error> {
             let wallet_name = &wallet_opts.wallet;
             let database_path = prepare_wallet_db_dir(wallet_name, &home_dir)?;
             #[cfg(any(feature = "sqlite", feature = "redb"))]
-            let result = {
-                let mut persister: Persister = match &wallet_opts.database_type {
-                    #[cfg(feature = "sqlite")]
-                    DatabaseType::Sqlite => {
-                        let db_file = database_path.join("wallet.sqlite");
-                        let connection = Connection::open(db_file).map_err(PersisterError::from)?;
-                        log::debug!("Sqlite database opened successfully");
-                        Persister::Connection(connection)
-                    }
-                    #[cfg(feature = "redb")]
-                    DatabaseType::Redb => {
-                        let db_file = database_path.join("wallet.redb");
-                        let store = RedbStore::new(
-                            db_file,
-                            wallet_name.clone().unwrap_or("wallet1".to_string()),
-                        )
-                        .map_err(PersisterError::from)?;
-                        log::debug!("Redb database opened successfully");
-                        Persister::RedbStore(store)
-                    }
-                };
+            let result = match &wallet_opts.database_type {
+                #[cfg(feature = "sqlite")]
+                DatabaseType::Sqlite => {
+                    let db_file = database_path.join("wallet.sqlite");
+                    let mut connection = Connection::open(db_file)?;
+                    log::debug!("Sqlite database opened successfully");
+                    let mut wallet = new_persisted_wallet(network, &mut connection, &wallet_opts)?;
+                    let blockchain_client =
+                        new_blockchain_client(&wallet_opts, &wallet, database_path)?;
 
-                let mut wallet = new_persisted_wallet(network, &mut persister, &wallet_opts)?;
-                let blockchain_client =
-                    new_blockchain_client(&wallet_opts, &wallet, database_path)?;
+                    let result = handle_online_wallet_subcommand(
+                        &mut wallet,
+                        blockchain_client,
+                        online_subcommand,
+                    )
+                    .await?;
+                    wallet.persist(&mut connection)?;
+                    result
+                }
+                #[cfg(feature = "redb")]
+                DatabaseType::Redb => {
+                    let db_file = database_path.join("wallet.redb");
+                    let mut store = RedbStore::new(
+                        db_file,
+                        wallet_name.clone().unwrap_or("wallet1".to_string()),
+                    )?;
+                    log::debug!("Redb database opened successfully");
+                    let mut wallet = new_persisted_wallet(network, &mut store, &wallet_opts)?;
+                    let blockchain_client =
+                        new_blockchain_client(&wallet_opts, &wallet, database_path)?;
 
-                let result = handle_online_wallet_subcommand(
-                    &mut wallet,
-                    blockchain_client,
-                    online_subcommand,
-                )
-                .await?;
-                wallet.persist(&mut persister)?;
-                result
+                    let result = handle_online_wallet_subcommand(
+                        &mut wallet,
+                        blockchain_client,
+                        online_subcommand,
+                    )
+                    .await?;
+                    wallet.persist(&mut store)?;
+                    result
+                }
             };
             #[cfg(not(any(feature = "sqlite", feature = "redb")))]
             let result = {
@@ -816,39 +820,44 @@ pub(crate) async fn handle_command(cli_opts: CliOpts) -> Result<String, Error> {
         } => {
             let network = cli_opts.network;
             #[cfg(any(feature = "sqlite", feature = "redb"))]
-            let result = {
-                let home_dir = prepare_home_dir(cli_opts.datadir)?;
-                let wallet_name = &wallet_opts.wallet;
-                let database_path = prepare_wallet_db_dir(wallet_name, &home_dir)?;
-                let mut persister: Persister = match &wallet_opts.database_type {
-                    #[cfg(feature = "sqlite")]
-                    DatabaseType::Sqlite => {
-                        let db_file = database_path.join("wallet.sqlite");
-                        let connection = Connection::open(db_file).map_err(PersisterError::from)?;
-                        log::debug!("Sqlite database opened successfully");
-                        Persister::Connection(connection)
-                    }
-                    #[cfg(feature = "redb")]
-                    DatabaseType::Redb => {
-                        let db_file = database_path.join("wallet.redb");
-                        let store = bdk_redb::Store::new(
-                            db_file,
-                            wallet_name.clone().unwrap_or("wallet1".to_string()),
-                        )
-                        .map_err(PersisterError::from)?;
-                        log::debug!("Redb database opened successfully");
-                        Persister::RedbStore(store)
-                    }
-                };
-
-                let mut wallet = new_persisted_wallet(network, &mut persister, &wallet_opts)?;
-                let result = handle_offline_wallet_subcommand(
-                    &mut wallet,
-                    &wallet_opts,
-                    offline_subcommand,
-                )?;
-                wallet.persist(&mut persister)?;
-                result
+            let result = match &wallet_opts.database_type {
+                #[cfg(feature = "sqlite")]
+                DatabaseType::Sqlite => {
+                    let home_dir = prepare_home_dir(cli_opts.datadir)?;
+                    let wallet_name = &wallet_opts.wallet;
+                    let database_path = prepare_wallet_db_dir(wallet_name, &home_dir)?;
+                    let db_file = database_path.join("wallet.sqlite");
+                    let mut persister = Connection::open(db_file)?;
+                    log::debug!("Sqlite database opened successfully");
+                    let mut wallet = new_persisted_wallet(network, &mut persister, &wallet_opts)?;
+                    let result = handle_offline_wallet_subcommand(
+                        &mut wallet,
+                        &wallet_opts,
+                        offline_subcommand,
+                    )?;
+                    wallet.persist(&mut persister)?;
+                    result
+                }
+                #[cfg(feature = "redb")]
+                DatabaseType::Redb => {
+                    let home_dir = prepare_home_dir(cli_opts.datadir)?;
+                    let wallet_name = &wallet_opts.wallet;
+                    let database_path = prepare_wallet_db_dir(wallet_name, &home_dir)?;
+                    let db_file = database_path.join("wallet.redb");
+                    let mut persister = bdk_redb::Store::new(
+                        db_file,
+                        wallet_name.clone().unwrap_or("wallet1".to_string()),
+                    )?;
+                    log::debug!("Redb database opened successfully");
+                    let mut wallet = new_persisted_wallet(network, &mut persister, &wallet_opts)?;
+                    let result = handle_offline_wallet_subcommand(
+                        &mut wallet,
+                        &wallet_opts,
+                        offline_subcommand,
+                    )?;
+                    wallet.persist(&mut persister)?;
+                    result
+                }
             };
             #[cfg(not(any(feature = "sqlite", feature = "redb")))]
             let result = {
@@ -874,75 +883,133 @@ pub(crate) async fn handle_command(cli_opts: CliOpts) -> Result<String, Error> {
         #[cfg(feature = "repl")]
         CliSubCommand::Repl { wallet_opts } => {
             let network = cli_opts.network;
-            #[cfg(any(feature = "sqlite", feature = "redb"))]
-            let (mut wallet, mut persister) = {
-                let wallet_name = &wallet_opts.wallet;
+            let wallet_name = &wallet_opts.wallet;
 
-                let home_dir = prepare_home_dir(cli_opts.datadir.clone())?;
-
-                let database_path = prepare_wallet_db_dir(wallet_name, &home_dir)?;
-
-                let mut persister: Persister = match &wallet_opts.database_type {
-                    #[cfg(feature = "sqlite")]
-                    DatabaseType::Sqlite => {
-                        let db_file = database_path.join("wallet.sqlite");
-                        let connection = Connection::open(db_file).map_err(PersisterError::from)?;
-                        log::debug!("Sqlite database opened successfully");
-                        Persister::Connection(connection)
-                    }
-                    #[cfg(feature = "redb")]
-                    DatabaseType::Redb => {
-                        let db_file = database_path.join("wallet.redb");
-                        let store = bdk_redb::Store::new(
-                            db_file,
-                            wallet_name.clone().unwrap_or("wallet1".to_string()),
-                        )
-                        .unwrap();
-                        log::debug!("Redb database opened successfully");
-                        Persister::RedbStore(store)
-                    }
-                };
-                let wallet = new_persisted_wallet(network, &mut persister, &wallet_opts)?;
-                (wallet, persister)
-            };
-            #[cfg(not(any(feature = "sqlite", feature = "redb")))]
-            let mut wallet = new_wallet(network, &wallet_opts)?;
             let home_dir = prepare_home_dir(cli_opts.datadir.clone())?;
-            let database_path = prepare_wallet_db_dir(&wallet_opts.wallet, &home_dir)?;
 
-            loop {
-                let line = readline()?;
-                let line = line.trim();
-                if line.is_empty() {
-                    continue;
-                }
+            let database_path = prepare_wallet_db_dir(wallet_name, &home_dir)?;
 
-                let result = respond(
-                    network,
-                    &mut wallet,
-                    &wallet_opts,
-                    line,
-                    database_path.clone(),
-                )
-                .await;
-                #[cfg(any(feature = "sqlite", feature = "redb"))]
-                wallet.persist(&mut persister)?;
-
-                match result {
-                    Ok(quit) => {
-                        if quit {
-                            break;
-                        }
+            #[cfg(not(any(feature = "sqlite", feature = "redb")))]
+            {
+                let mut wallet = new_wallet(network, &wallet_opts)?;
+                loop {
+                    let line = readline()?;
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
                     }
-                    Err(err) => {
-                        writeln!(std::io::stdout(), "{err}")
-                            .map_err(|e| Error::Generic(e.to_string()))?;
-                        std::io::stdout()
-                            .flush()
-                            .map_err(|e| Error::Generic(e.to_string()))?;
+
+                    let result = respond(
+                        network,
+                        &mut wallet,
+                        &wallet_opts,
+                        line,
+                        database_path.clone(),
+                    )
+                    .await;
+
+                    match result {
+                        Ok(quit) => {
+                            if quit {
+                                break;
+                            }
+                        }
+                        Err(err) => {
+                            writeln!(std::io::stdout(), "{err}")
+                                .map_err(|e| Error::Generic(e.to_string()))?;
+                            std::io::stdout()
+                                .flush()
+                                .map_err(|e| Error::Generic(e.to_string()))?;
+                        }
                     }
                 }
             }
+
+            #[cfg(any(feature = "sqlite", feature = "redb"))]
+            match &wallet_opts.database_type {
+                #[cfg(feature = "sqlite")]
+                DatabaseType::Sqlite => {
+                    let db_file = database_path.join("wallet.sqlite");
+                    let mut persister = Connection::open(db_file)?;
+                    log::debug!("Sqlite database opened successfully");
+                    let mut wallet = new_persisted_wallet(network, &mut persister, &wallet_opts)?;
+                    loop {
+                        let line = readline()?;
+                        let line = line.trim();
+                        if line.is_empty() {
+                            continue;
+                        }
+
+                        let result = respond(
+                            network,
+                            &mut wallet,
+                            &wallet_opts,
+                            line,
+                            database_path.clone(),
+                        )
+                        .await;
+                        wallet.persist(&mut persister)?;
+
+                        match result {
+                            Ok(quit) => {
+                                if quit {
+                                    break;
+                                }
+                            }
+                            Err(err) => {
+                                writeln!(std::io::stdout(), "{err}")
+                                    .map_err(|e| Error::Generic(e.to_string()))?;
+                                std::io::stdout()
+                                    .flush()
+                                    .map_err(|e| Error::Generic(e.to_string()))?;
+                            }
+                        }
+                    }
+                }
+                #[cfg(feature = "redb")]
+                DatabaseType::Redb => {
+                    let db_file = database_path.join("wallet.redb");
+                    let mut persister = bdk_redb::Store::new(
+                        db_file,
+                        wallet_name.clone().unwrap_or("wallet1".to_string()),
+                    )?;
+                    log::debug!("Redb database opened successfully");
+                    let mut wallet = new_persisted_wallet(network, &mut persister, &wallet_opts)?;
+
+                    loop {
+                        let line = readline()?;
+                        let line = line.trim();
+                        if line.is_empty() {
+                            continue;
+                        }
+
+                        let result = respond(
+                            network,
+                            &mut wallet,
+                            &wallet_opts,
+                            line,
+                            database_path.clone(),
+                        )
+                        .await;
+                        wallet.persist(&mut persister)?;
+
+                        match result {
+                            Ok(quit) => {
+                                if quit {
+                                    break;
+                                }
+                            }
+                            Err(err) => {
+                                writeln!(std::io::stdout(), "{err}")
+                                    .map_err(|e| Error::Generic(e.to_string()))?;
+                                std::io::stdout()
+                                    .flush()
+                                    .map_err(|e| Error::Generic(e.to_string()))?;
+                            }
+                        }
+                    }
+                }
+            };
             Ok("".to_string())
         }
     };
